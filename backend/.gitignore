@@ -1,0 +1,52 @@
+Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+VS Code settings
+.vscode/
+
+Virtual environment folders
+venv/
+env/
+ENV/
+.venv/
+
+Environment variables
+*.env
+.env.*
+
+Python build files
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+PyInstaller
+*.manifest
+*.spec
+
+Logs
+*.log
+logs/
+
+Cache
+.cache/
+pytest_cache/
+coverage_html/
+htmlcov/
+
+macOS
+.DS_Store
+
+IDE
+.idea/
