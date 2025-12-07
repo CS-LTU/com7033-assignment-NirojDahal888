@@ -1,0 +1,420 @@
+from flask import Flask, jsonify, request, redirect, url_for
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from flask_wtf.csrf import CSRFProtect
+from flask_cors import CORS
+from config import Config
+from models.user import MongoUser
+from models.predictor import stroke_predictor
+
+from models.patient import Patient
+from utils import secure_route, validate_and_sanitize, logger
+from bson import ObjectId
+import re
+import math
+
+# ==========================
+# Initialize Flask App
+# ==========================
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# --------------------------
+# Secret key for sessions
+# --------------------------
+app.config['SECRET_KEY'] = "your_super_secret_key_here"
+
+# --------------------------
+# Session / Cookie Settings (dev localhost)
+# --------------------------
+app.config['SESSION_COOKIE_NAME'] = "session"
+app.config['SESSION_COOKIE_HTTPONLY'] = True      # JS cannot access
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'     # Works for localhost cross-site POST
+app.config['SESSION_COOKIE_SECURE'] = False       # HTTP dev only, set True in production
+
+# ==========================
+# Enable CORS for React frontend
+# ==========================
+CORS(
+    app,
+    supports_credentials=True,
+    origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ]
+)
+
+# ==========================
+# CSRF Protection
+# ==========================
+csrf = CSRFProtect(app)
+
+# ==========================
+# Login Manager Setup
+# ==========================
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = None  # API-only
+
+@login_manager.user_loader
+def load_user(user_id):
+    return MongoUser.get_by_id(user_id)
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    if 'api' in request.path or request.headers.get('Accept') == 'application/json':
+        return jsonify({"error": "Unauthorized - please log in"}), 401
+    return redirect(url_for(login_manager.login_view))
+
+# ==========================
+# Helper: Get POST data (JSON or Form)
+# ==========================
+def get_post_data():
+    """
+    Returns POST data from request.
+    Accepts JSON or form-encoded data.
+    """
+    if request.is_json:
+        return validate_and_sanitize(request.get_json() or {})
+    else:
+        return validate_and_sanitize(request.form.to_dict())
+
+# ==========================
+# AUTH ROUTES
+# ==========================
+@app.route('/api/auth/register', methods=['POST'])
+@secure_route
+@csrf.exempt
+def register():
+    data = get_post_data()
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    # Validate username
+    if not re.match(r'^[A-Za-z0-9]+$', username):
+        return jsonify({"error": "Username can only contain alphabets and numbers."}), 400
+
+    try:
+        user = MongoUser.create(data)
+        login_user(user)
+        return jsonify({"message": "User registered and logged in"}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/api/auth/login', methods=['POST'])
+@secure_route
+@csrf.exempt
+def login():
+    data = get_post_data()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    user, _ = MongoUser.get_by_username(username)
+    if user and user.check_password(password):
+        login_user(user)
+        return jsonify({"message": "Logged in successfully"}), 200
+
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route('/api/auth/logout', methods=['POST'])
+@login_required
+@secure_route
+@csrf.exempt
+def logout():
+    logout_user()
+    return jsonify({"message": "Logged out successfully"}), 200
+
+@app.route('/api/auth/current_user', methods=['GET'])
+@login_required
+@secure_route
+def get_current_user():
+    user = current_user
+    if user:
+        return jsonify({"user": {"username": user.username}}), 200
+    return jsonify({"user": None}), 200
+
+# ==========================
+# PATIENT CRUD ROUTES
+# ==========================
+@app.route('/api/patients', methods=['GET'])
+@login_required
+@secure_route
+def get_patients():
+    """
+    Get paginated, sortable, and filterable list of patients.
+    Query Parameters:
+    - page: Page number (default=1)
+    - per_page: Items per page (default=20)
+    - sort_field: Field to sort by (default=id)
+    - sort_order: 1=ascending, -1=descending (default=1)
+    - filter_field: Field to filter by (optional)
+    - filter_value: Value to filter (optional)
+    - test_records_only: Set to 'true' to return only test records (for testing)
+    """
+    # ====== Pagination ======
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 20))
+    skip = (page - 1) * per_page
+
+    # ====== Sorting ======
+    sort_field = request.args.get('sort_field', 'id')
+    sort_order = int(request.args.get('sort_order', 1))  # 1=asc, -1=desc
+
+    # ====== Filtering ======
+    filter_field = request.args.get('filter_field')
+    filter_value = request.args.get('filter_value')
+    test_records_only = request.args.get('test_records_only', 'false').lower() == 'true'
+    
+    query = {}
+    if filter_field and filter_value:
+        query[filter_field] = filter_value
+    
+    # For test isolation - only return test records if requested
+    if test_records_only:
+        query['test_record'] = True
+
+    # ====== Fetch Patients ======
+    patients = Patient.read_all(skip=skip, limit=per_page, sort_field=sort_field, sort_order=sort_order, query=query)
+    total_count = Patient.count_all(query=query)
+
+    # ====== Convert to JSON Serializable ======
+    serializable = []
+    for p in patients:
+        clean = {}
+        for k, v in p.items():
+            if isinstance(v, ObjectId):
+                clean[k] = str(v)
+            elif isinstance(v, float) and math.isnan(v):
+                clean[k] = None
+            else:
+                clean[k] = v
+        serializable.append(clean)
+
+    return jsonify({
+        "patients": serializable,
+        "page": page,
+        "per_page": per_page,
+        "total": total_count
+    }), 200
+    patients = Patient.read_all()
+    
+    serializable = []
+    for p in patients:
+        clean = {}
+        for k, v in p.items():
+            # Convert ObjectId to string
+            if isinstance(v, ObjectId):
+                clean[k] = str(v)
+            # Replace NaN with None
+            elif isinstance(v, float) and math.isnan(v):
+                clean[k] = None
+            else:
+                clean[k] = v
+        serializable.append(clean)
+
+    return jsonify(serializable), 200
+
+
+@app.route('/api/patients/<patient_id>', methods=['GET'])
+@login_required
+@secure_route
+def get_patient(patient_id):
+    patient = Patient.read_one(patient_id)
+    if not patient:
+        return jsonify({"error": "Patient not found"}), 404
+
+    clean_patient = {}
+    for k, v in patient.items():
+        if isinstance(v, ObjectId):
+            clean_patient[k] = str(v)
+        elif isinstance(v, float) and math.isnan(v):
+            clean_patient[k] = None
+        else:
+            clean_patient[k] = v
+
+    return jsonify(clean_patient), 200
+
+@app.route('/api/patients', methods=['POST'])
+@login_required
+@secure_route
+@csrf.exempt
+def create_patient():
+    data = get_post_data()
+
+    # Validate age
+    age = data.get('age')
+    if age is None:
+        return jsonify({"error": "Age is required"}), 400
+    if not (0 <= age <= 120):
+        return jsonify({"error": "Age must be between 0 and 120 years"}), 400
+
+    # Validate glucose level (medical range: 40-600 mg/dL)
+    glucose = data.get('avg_glucose_level')
+    if glucose is None:
+        return jsonify({"error": "Average glucose level is required"}), 400
+    if not (40 <= glucose <= 600):
+        return jsonify({"error": "Glucose level must be between 40 and 600 mg/dL (realistic medical range)"}), 400
+
+    # Validate BMI (medical range: 10-80)
+    bmi = data.get('bmi')
+    if bmi is None:
+        return jsonify({"error": "BMI is required"}), 400
+    if not (10 <= bmi <= 80):
+        return jsonify({"error": "BMI must be between 10 and 80 (realistic medical range)"}), 400
+
+    patient_id = Patient.create(data)
+    return jsonify({"id": patient_id, "message": "Patient created"}), 201
+
+
+@app.route('/api/patients/<patient_id>', methods=['PUT'])
+@login_required
+@secure_route
+@csrf.exempt
+def update_patient(patient_id):
+    data = get_post_data()
+
+    # Validate age if provided
+    if 'age' in data:
+        age = data['age']
+        if not (0 <= age <= 120):
+            return jsonify({"error": "Age must be between 0 and 120 years"}), 400
+
+    # Validate glucose level if provided (medical range: 40-600 mg/dL)
+    if 'avg_glucose_level' in data:
+        glucose = data['avg_glucose_level']
+        if not (40 <= glucose <= 600):
+            return jsonify({"error": "Glucose level must be between 40 and 600 mg/dL (realistic medical range)"}), 400
+
+    # Validate BMI if provided (medical range: 10-80)
+    if 'bmi' in data:
+        bmi = data['bmi']
+        if not (10 <= bmi <= 80):
+            return jsonify({"error": "BMI must be between 10 and 80 (realistic medical range)"}), 400
+
+    result = Patient.update(patient_id, data)
+    return jsonify({"modified": result.modified_count, "message": "Patient updated"}), 200
+
+
+@app.route('/api/patients/<patient_id>', methods=['DELETE'])
+@login_required
+@secure_route
+@csrf.exempt
+def delete_patient(patient_id):
+    Patient.delete(patient_id)
+    return jsonify({"message": "Patient deleted"}), 200
+
+# ==========================
+# STROKE PREDICTION ROUTES
+# ==========================
+@app.route('/api/predict/stroke', methods=['POST'])
+@login_required
+@secure_route
+@csrf.exempt
+def predict_stroke():
+    """
+    Predict stroke risk based on patient data.
+    Accepts patient information and returns risk assessment.
+    """
+    data = get_post_data()
+    
+    try:
+        # Calculate risk score
+        prediction = stroke_predictor.calculate_risk_score(data)
+        
+        logger.info(f"Stroke risk prediction: {prediction['risk_level']} (score: {prediction['risk_score']})")
+        
+        return jsonify({
+            "prediction": prediction,
+            "patient_data": {
+                "age": data.get('age'),
+                "gender": data.get('gender'),
+                "hypertension": data.get('hypertension'),
+                "heart_disease": data.get('heart_disease'),
+                "avg_glucose_level": data.get('avg_glucose_level'),
+                "bmi": data.get('bmi'),
+                "smoking_status": data.get('smoking_status')
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        return jsonify({"error": "Failed to calculate stroke risk"}), 500
+
+@app.route('/api/predict/patient/<patient_id>', methods=['GET'])
+@login_required
+@secure_route
+def predict_patient_stroke(patient_id):
+    """
+    Get stroke risk prediction for an existing patient.
+    """
+    patient = Patient.read_one(patient_id)
+    if not patient:
+        return jsonify({"error": "Patient not found"}), 404
+    
+    try:
+        # Calculate risk score
+        prediction = stroke_predictor.calculate_risk_score(patient)
+        
+        # Clean patient data for response
+        clean_patient = {}
+        for k, v in patient.items():
+            if isinstance(v, ObjectId):
+                clean_patient[k] = str(v)
+            elif isinstance(v, float) and math.isnan(v):
+                clean_patient[k] = None
+            else:
+                clean_patient[k] = v
+        
+        return jsonify({
+            "prediction": prediction,
+            "patient": clean_patient
+        }), 200
+    except Exception as e:
+        logger.error(f"Prediction error for patient {patient_id}: {str(e)}")
+        return jsonify({"error": "Failed to calculate stroke risk"}), 500
+
+@app.route('/api/predict/statistics', methods=['GET'])
+@login_required
+@secure_route
+def get_prediction_statistics():
+    """
+    Get dataset statistics for stroke prediction context.
+    """
+    try:
+        stats = stroke_predictor.get_dataset_statistics()
+        return jsonify(stats), 200
+    except Exception as e:
+        logger.error(f"Statistics error: {str(e)}")
+        return jsonify({"error": "Failed to retrieve statistics"}), 500
+
+
+    Patient.delete(patient_id)
+    return jsonify({"message": "Patient deleted"}), 200
+
+# ==========================
+# ERROR HANDLERS
+# ==========================
+@app.errorhandler(400)
+def bad_request(e):
+    logger.warning(f"Bad request: {request.url} - {getattr(e, 'description', str(e))}")
+    return jsonify({"error": getattr(e, "description", "Bad request")}), 400
+
+@app.errorhandler(404)
+def not_found(e):
+    logger.warning(f"Not found: {request.url}")
+    return jsonify({"error": "Resource not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal error: {str(e)}")
+    return jsonify({"error": "Internal server error"}), 500
+
+# ==========================
+# RUN APP
+# ==========================
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=8000)
